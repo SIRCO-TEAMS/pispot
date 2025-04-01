@@ -195,3 +195,7 @@ If you need to **use a keyboard** while connected to a PC:
 ✅ **Ensures safe shrinking (error prevents data loss).**  
 ✅ **Can format storage anytime via the `-f` flag.**  
 ✅ **Allows simultaneous USB peripheral usage via a hub.**  
+
+extra
+
+sudo truncate -s 5G /usb_drive.img
