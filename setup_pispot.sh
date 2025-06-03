@@ -2,6 +2,28 @@
 
 set -e
 
+# --- RESET EVERYTHING SECTION ---
+echo "==== PiSpot: Resetting all previous configuration ===="
+# Stop and purge nginx and hostapd if present
+sudo systemctl stop nginx || true
+sudo systemctl stop hostapd || true
+sudo apt-get purge -y nginx nginx-common hostapd || true
+sudo apt-get autoremove -y || true
+
+# Remove config files and scripts
+sudo rm -f /etc/hostapd/hostapd.conf
+sudo rm -f /etc/rc.local
+sudo rm -f /usb_drive.img
+sudo rm -f /var/www/html/pispot.html
+sudo rm -f ~/expand_usb.sh ~/shrink_usb.sh ~/autosave.sh ~/blink_led.sh
+sudo rm -f /home/*/expand_usb.sh /home/*/shrink_usb.sh /home/*/autosave.sh /home/*/blink_led.sh 2>/dev/null || true
+
+# Remove any leftover PiSpot config in /boot
+sudo sed -i '/dtoverlay=dwc2/d' /boot/config.txt || true
+sudo sed -i 's/ modules-load=dwc2,g_mass_storage//' /boot/cmdline.txt || true
+
+echo "==== PiSpot: Reset complete ===="
+
 # Dynamically get the username (prefer SUDO_USER, fallback to whoami)
 USERNAME="${SUDO_USER:-$(whoami)}"
 USERHOME="$(eval echo ~${USERNAME})"
@@ -64,9 +86,24 @@ fi
 
 # 4. USB Storage Image
 if [ ! -f /usb_drive.img ]; then
-    echo "Creating 5GB USB storage image..."
-    sudo dd if=/dev/zero of=/usb_drive.img bs=1M count=5120
+    echo "Creating 5GB USB storage image (fast)..."
+    if sudo fallocate -l 5G /usb_drive.img 2>/dev/null; then
+        echo "fallocate succeeded."
+    else
+        echo "fallocate not supported, falling back to slow dd..."
+        sudo dd if=/dev/zero of=/usb_drive.img bs=1M count=5120
+    fi
     sudo mkfs.ext4 /usb_drive.img
+fi
+
+# Ensure /etc/rc.local exists and is executable
+if [ ! -f /etc/rc.local ]; then
+    echo "Creating /etc/rc.local..."
+    sudo tee /etc/rc.local > /dev/null <<'EORC'
+#!/bin/bash
+exit 0
+EORC
+    sudo chmod +x /etc/rc.local
 fi
 
 # 5. Load USB storage on boot
@@ -130,9 +167,9 @@ echo "Installing nginx web server..."
 sudo apt-get update
 sudo apt-get install -y nginx
 
-echo "Configuring nginx to listen on 192.168.4.1 only..."
-sudo sed -i 's/listen 80 default_server;/listen 192.168.4.1:80 default_server;/' /etc/nginx/sites-available/default
-sudo sed -i 's/listen \[::\]:80 default_server;/# listen [::]:80 default_server;/' /etc/nginx/sites-available/default
+# Fix: Listen on all interfaces so nginx always starts, even if 192.168.4.1 is not up yet
+sudo sed -i 's/listen 192.168.4.1:80 default_server;/listen 80 default_server;/' /etc/nginx/sites-available/default
+sudo sed -i 's/# listen \[::\]:80 default_server;/listen [::]:80 default_server;/' /etc/nginx/sites-available/default
 
 echo "Deploying PiSpot control panel..."
 sudo tee /var/www/html/pispot.html > /dev/null <<'EOPANEL'
@@ -188,6 +225,24 @@ echo "==== Nginx and PiSpot control panel installed! ===="
 echo "Access the control panel at: http://192.168.4.1/"
 
 # 8. Wi-Fi Hotspot Setup
+echo "Installing hostapd..."
+sudo apt-get install -y hostapd
+sudo systemctl unmask hostapd
+sudo systemctl enable hostapd
+
+# Ensure /etc/hostapd exists
+sudo mkdir -p /etc/hostapd
+
+# Disable dhcpcd and wpa_supplicant for wlan0 to avoid conflicts (for offline AP mode)
+sudo sed -i '/^interface wlan0/d' /etc/dhcpcd.conf 2>/dev/null || true
+echo "interface wlan0" | sudo tee -a /etc/dhcpcd.conf
+echo "    static ip_address=192.168.4.1/24" | sudo tee -a /etc/dhcpcd.conf
+sudo systemctl restart dhcpcd
+
+# Stop wpa_supplicant on wlan0 to prevent it from interfering with AP mode
+sudo systemctl stop wpa_supplicant@wlan0.service || true
+sudo systemctl disable wpa_supplicant@wlan0.service || true
+
 echo "==== PiSpot Wi-Fi Hotspot Setup ===="
 read -p "Enter desired SSID [default: PiSpot]: " PISPOT_SSID
 PISPOT_SSID=${PISPOT_SSID:-PiSpot}
@@ -205,6 +260,11 @@ else
     IGNORE_BROADCAST_SSID=1
 fi
 
+# Set Wi-Fi country to US for regulatory compliance
+echo "Setting Wi-Fi country to US..."
+sudo sed -i '/^country=/d' /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
+echo "country=US" | sudo tee -a /etc/wpa_supplicant/wpa_supplicant.conf
+
 echo "Configuring hostapd..."
 sudo tee /etc/hostapd/hostapd.conf > /dev/null <<EOF
 interface=wlan0
@@ -214,13 +274,77 @@ channel=7
 wpa=2
 wpa_passphrase=${PISPOT_PASS}
 ignore_broadcast_ssid=${IGNORE_BROADCAST_SSID}
+country_code=US
 EOF
 
 sudo sed -i 's|^DAEMON_CONF=.*|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
 
 sudo systemctl restart hostapd || true
 
-echo "==== PiSpot Wi-Fi Hotspot configured! ===="
+# Set up a basic DHCP server for clients (dnsmasq)
+echo "Installing dnsmasq for DHCP..."
+sudo apt-get install -y dnsmasq
+sudo tee /etc/dnsmasq.conf > /dev/null <<EOF
+interface=wlan0
+dhcp-range=192.168.4.2,192.168.4.20,255.255.255.0,24h
+EOF
+sudo systemctl restart dnsmasq
 
-echo "==== PiSpot setup complete! ===="
-echo "Reboot required for all changes to take effect."
+# Save settings and log actions
+SETTINGS_FILE="/workspaces/pispot/settings.txt"
+LOG_FILE="/workspaces/pispot/setup.log"
+mkdir -p /workspaces/pispot
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
+}
+
+save_setting() {
+    echo "$1" >> "$SETTINGS_FILE"
+}
+
+# Clear previous settings/log
+: > "$SETTINGS_FILE"
+: > "$LOG_FILE"
+
+log "LED mode selected: $LEDMODE"
+save_setting "LED_MODE=$LEDMODE"
+
+log "Auto-save script installed"
+save_setting "AUTOSAVE_SCRIPT=enabled"
+
+log "USB gadget mode configured"
+save_setting "USB_GADGET=enabled"
+
+log "USB storage image created"
+save_setting "USB_STORAGE_IMG=5GB"
+
+log "Expand/shrink scripts installed"
+save_setting "EXPAND_SHRINK_SCRIPTS=enabled"
+
+log "nginx installed and control panel deployed"
+save_setting "WEBSERVER=nginx"
+save_setting "WEB_PANEL_URL=http://192.168.4.1/"
+
+log "hostapd installed and configured"
+save_setting "SSID=$PISPOT_SSID"
+save_setting "WIFI_PASSWORD=$PISPOT_PASS"
+save_setting "WIFI_VISIBLE=$PISPOT_VISIBLE"
+save_setting "WIFI_COUNTRY=US"
+save_setting "STATIC_IP=192.168.4.1"
+save_setting "DHCP_RANGE=192.168.4.2-192.168.4.20"
+
+log "dnsmasq installed for DHCP"
+save_setting "DHCP_SERVER=dnsmasq"
+
+echo "==== PiSpot Wi-Fi Hotspot configured! ====" | tee -a "$LOG_FILE"
+echo "==== PiSpot setup complete! ====" | tee -a "$LOG_FILE"
+echo "Settings saved to $SETTINGS_FILE" | tee -a "$LOG_FILE"
+echo "Log saved to $LOG_FILE" | tee -a "$LOG_FILE"
+
+echo
+echo "==== FINAL STEP ===="
+echo "Unplug the ethernet cable from your Pi now."
+read -p "Press ENTER to reboot and finish setup..." _
+log "User prompted to unplug ethernet and reboot"
+sudo reboot
