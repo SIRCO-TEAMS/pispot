@@ -1,4 +1,3 @@
-```markdown
 # **Complete Guide: USB Gadget Mode on Raspberry Pi with Dynamic Storage Resizing**
 
 ## **Overview**
