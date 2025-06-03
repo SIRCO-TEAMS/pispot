@@ -187,5 +187,40 @@ sudo systemctl restart nginx
 echo "==== Nginx and PiSpot control panel installed! ===="
 echo "Access the control panel at: http://192.168.4.1/"
 
+# 8. Wi-Fi Hotspot Setup
+echo "==== PiSpot Wi-Fi Hotspot Setup ===="
+read -p "Enter desired SSID [default: PiSpot]: " PISPOT_SSID
+PISPOT_SSID=${PISPOT_SSID:-PiSpot}
+read -p "Enter Wi-Fi password (min 8 chars) [default: pistop123]: " PISPOT_PASS
+PISPOT_PASS=${PISPOT_PASS:-pistop123}
+while [ ${#PISPOT_PASS} -lt 8 ]; do
+    echo "Password must be at least 8 characters."
+    read -p "Enter Wi-Fi password (min 8 chars): " PISPOT_PASS
+done
+read -p "Should the network be visible? (y/n) [default: y]: " PISPOT_VISIBLE
+PISPOT_VISIBLE=${PISPOT_VISIBLE:-y}
+if [[ "$PISPOT_VISIBLE" =~ ^[Yy]$ ]]; then
+    IGNORE_BROADCAST_SSID=0
+else
+    IGNORE_BROADCAST_SSID=1
+fi
+
+echo "Configuring hostapd..."
+sudo tee /etc/hostapd/hostapd.conf > /dev/null <<EOF
+interface=wlan0
+ssid=${PISPOT_SSID}
+hw_mode=g
+channel=7
+wpa=2
+wpa_passphrase=${PISPOT_PASS}
+ignore_broadcast_ssid=${IGNORE_BROADCAST_SSID}
+EOF
+
+sudo sed -i 's|^DAEMON_CONF=.*|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
+
+sudo systemctl restart hostapd || true
+
+echo "==== PiSpot Wi-Fi Hotspot configured! ===="
+
 echo "==== PiSpot setup complete! ===="
 echo "Reboot required for all changes to take effect."
