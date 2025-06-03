@@ -11,6 +11,12 @@ SETTINGS_FILE="$USERHOME/pispot/settings.txt"
 LOG_FILE="$USERHOME/pispot/setup.log"
 mkdir -p "$USERHOME/pispot"
 
+# Unblock Wi-Fi and set country code early to avoid rfkill issues
+sudo rfkill unblock wifi
+sudo raspi-config nonint do_wifi_country US
+sudo sed -i '/^country=/d' /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
+echo "country=US" | sudo tee -a /etc/wpa_supplicant/wpa_supplicant.conf
+
 # Define log and save_setting functions EARLY so they're available for all uses
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
@@ -293,7 +299,19 @@ DHCP_END=${DHCP_END:-192.168.4.20}
 sudo sed -i '/^interface wlan0/d' /etc/dhcpcd.conf 2>/dev/null || true
 echo "interface wlan0" | sudo tee -a /etc/dhcpcd.conf
 echo "    static ip_address=${PISPOT_IP}/24" | sudo tee -a /etc/dhcpcd.conf
-sudo systemctl restart dhcpcd
+
+# Ensure dhcpcd is installed before attempting to restart
+if ! dpkg -l | grep -qw dhcpcd5; then
+    echo "dhcpcd not found, installing..."
+    sudo apt-get install -y dhcpcd5
+fi
+
+# Try to restart dhcpcd if the service exists
+if systemctl list-unit-files | grep -q '^dhcpcd\.service'; then
+    sudo systemctl restart dhcpcd
+else
+    echo "Warning: dhcpcd.service not found, skipping restart."
+fi
 
 # Stop wpa_supplicant on wlan0 to prevent it from interfering with AP mode
 sudo systemctl stop wpa_supplicant@wlan0.service || true
@@ -345,6 +363,12 @@ interface=wlan0
 dhcp-range=${DHCP_START},${DHCP_END},255.255.255.0,24h
 EOF
 sudo systemctl restart dnsmasq
+
+# After setting up Wi-Fi SSID and password, save them for reference
+WIFI_SETTINGS_FILE="$USERHOME/pispot/wifi_settings.txt"
+echo "SSID: $PISPOT_SSID" > "$WIFI_SETTINGS_FILE"
+echo "Password: $PISPOT_PASS" >> "$WIFI_SETTINGS_FILE"
+echo "Visible: $PISPOT_VISIBLE" >> "$WIFI_SETTINGS_FILE"
 
 log "LED mode selected: $LEDMODE"
 save_setting "LED_MODE=$LEDMODE"
