@@ -2,6 +2,28 @@
 
 set -e
 
+# Dynamically get the username (prefer SUDO_USER, fallback to whoami)
+USERNAME="${SUDO_USER:-$(whoami)}"
+USERHOME="$(eval echo ~${USERNAME})"
+
+# Save settings and log actions
+SETTINGS_FILE="$USERHOME/pispot/settings.txt"
+LOG_FILE="$USERHOME/pispot/setup.log"
+mkdir -p "$USERHOME/pispot"
+
+# Define log and save_setting functions EARLY so they're available for all uses
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
+}
+
+save_setting() {
+    echo "$1" >> "$SETTINGS_FILE"
+}
+
+# Clear previous settings/log
+: > "$SETTINGS_FILE"
+: > "$LOG_FILE"
+
 # --- RESET EVERYTHING SECTION ---
 echo "==== PiSpot: Resetting all previous configuration ===="
 # Stop and purge nginx and hostapd if present
@@ -23,10 +45,6 @@ sudo sed -i '/dtoverlay=dwc2/d' /boot/config.txt || true
 sudo sed -i 's/ modules-load=dwc2,g_mass_storage//' /boot/cmdline.txt || true
 
 echo "==== PiSpot: Reset complete ===="
-
-# Dynamically get the username (prefer SUDO_USER, fallback to whoami)
-USERNAME="${SUDO_USER:-$(whoami)}"
-USERHOME="$(eval echo ~${USERNAME})"
 
 echo "==== PiSpot Automated Setup ===="
 
@@ -167,9 +185,13 @@ echo "Installing nginx web server..."
 sudo apt-get update
 sudo apt-get install -y nginx
 
-# Fix: Listen on all interfaces so nginx always starts, even if 192.168.4.1 is not up yet
-sudo sed -i 's/listen 192.168.4.1:80 default_server;/listen 80 default_server;/' /etc/nginx/sites-available/default
-sudo sed -i 's/# listen \[::\]:80 default_server;/listen [::]:80 default_server;/' /etc/nginx/sites-available/default
+# Ask user for nginx port (default: 80)
+read -p "Enter port for PiSpot web panel (nginx) [default: 80]: " NGINX_PORT
+NGINX_PORT=${NGINX_PORT:-80}
+
+# Update nginx to listen on the chosen port
+sudo sed -i "s/listen 80 default_server;/listen ${NGINX_PORT} default_server;/" /etc/nginx/sites-available/default
+sudo sed -i "s/listen \[::\]:80 default_server;/listen [::]:${NGINX_PORT} default_server;/" /etc/nginx/sites-available/default
 
 echo "Deploying PiSpot control panel..."
 sudo tee /var/www/html/pispot.html > /dev/null <<'EOPANEL'
@@ -222,7 +244,33 @@ sudo sed -i 's/index.nginx-debian.html/pispot.html/' /etc/nginx/sites-available/
 sudo systemctl restart nginx
 
 echo "==== Nginx and PiSpot control panel installed! ===="
-echo "Access the control panel at: http://192.168.4.1/"
+echo "Access the control panel at: http://${PISPOT_IP}:${NGINX_PORT}/"
+
+# --- Cockpit Setup ---
+read -p "Enter port for Cockpit web interface [default: 9090]: " COCKPIT_PORT
+COCKPIT_PORT=${COCKPIT_PORT:-9090}
+
+echo "Installing Cockpit web system manager..."
+sudo apt-get install -y cockpit
+
+if [ "$COCKPIT_PORT" != "9090" ]; then
+    sudo mkdir -p /etc/systemd/system/cockpit.socket.d
+    sudo tee /etc/systemd/system/cockpit.socket.d/listen.conf > /dev/null <<EOF
+[Socket]
+ListenStream=
+ListenStream=${COCKPIT_PORT}
+EOF
+fi
+
+sudo systemctl enable cockpit.socket
+sudo systemctl restart cockpit.socket
+
+log "Cockpit installed and configured on port $COCKPIT_PORT"
+save_setting "COCKPIT_PORT=$COCKPIT_PORT"
+save_setting "COCKPIT_URL=http://${PISPOT_IP}:${COCKPIT_PORT}/"
+
+echo "==== Cockpit web system manager installed! ===="
+echo "Access Cockpit at: http://${PISPOT_IP}:${COCKPIT_PORT}/"
 
 # 8. Wi-Fi Hotspot Setup
 echo "Installing hostapd..."
@@ -233,10 +281,18 @@ sudo systemctl enable hostapd
 # Ensure /etc/hostapd exists
 sudo mkdir -p /etc/hostapd
 
+# Ask user for PiSpot IP address (default: 192.168.4.1)
+read -p "Enter PiSpot IP address [default: 192.168.4.1]: " PISPOT_IP
+PISPOT_IP=${PISPOT_IP:-192.168.4.1}
+read -p "Enter DHCP range start [default: 192.168.4.2]: " DHCP_START
+DHCP_START=${DHCP_START:-192.168.4.2}
+read -p "Enter DHCP range end [default: 192.168.4.20]: " DHCP_END
+DHCP_END=${DHCP_END:-192.168.4.20}
+
 # Disable dhcpcd and wpa_supplicant for wlan0 to avoid conflicts (for offline AP mode)
 sudo sed -i '/^interface wlan0/d' /etc/dhcpcd.conf 2>/dev/null || true
 echo "interface wlan0" | sudo tee -a /etc/dhcpcd.conf
-echo "    static ip_address=192.168.4.1/24" | sudo tee -a /etc/dhcpcd.conf
+echo "    static ip_address=${PISPOT_IP}/24" | sudo tee -a /etc/dhcpcd.conf
 sudo systemctl restart dhcpcd
 
 # Stop wpa_supplicant on wlan0 to prevent it from interfering with AP mode
@@ -286,26 +342,9 @@ echo "Installing dnsmasq for DHCP..."
 sudo apt-get install -y dnsmasq
 sudo tee /etc/dnsmasq.conf > /dev/null <<EOF
 interface=wlan0
-dhcp-range=192.168.4.2,192.168.4.20,255.255.255.0,24h
+dhcp-range=${DHCP_START},${DHCP_END},255.255.255.0,24h
 EOF
 sudo systemctl restart dnsmasq
-
-# Save settings and log actions
-SETTINGS_FILE="/workspaces/pispot/settings.txt"
-LOG_FILE="/workspaces/pispot/setup.log"
-mkdir -p /workspaces/pispot
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
-}
-
-save_setting() {
-    echo "$1" >> "$SETTINGS_FILE"
-}
-
-# Clear previous settings/log
-: > "$SETTINGS_FILE"
-: > "$LOG_FILE"
 
 log "LED mode selected: $LEDMODE"
 save_setting "LED_MODE=$LEDMODE"
@@ -324,15 +363,15 @@ save_setting "EXPAND_SHRINK_SCRIPTS=enabled"
 
 log "nginx installed and control panel deployed"
 save_setting "WEBSERVER=nginx"
-save_setting "WEB_PANEL_URL=http://192.168.4.1/"
+save_setting "WEB_PANEL_URL=http://${PISPOT_IP}:${NGINX_PORT}/"
 
 log "hostapd installed and configured"
 save_setting "SSID=$PISPOT_SSID"
 save_setting "WIFI_PASSWORD=$PISPOT_PASS"
 save_setting "WIFI_VISIBLE=$PISPOT_VISIBLE"
 save_setting "WIFI_COUNTRY=US"
-save_setting "STATIC_IP=192.168.4.1"
-save_setting "DHCP_RANGE=192.168.4.2-192.168.4.20"
+save_setting "STATIC_IP=${PISPOT_IP}"
+save_setting "DHCP_RANGE=${DHCP_START}-${DHCP_END}"
 
 log "dnsmasq installed for DHCP"
 save_setting "DHCP_SERVER=dnsmasq"
